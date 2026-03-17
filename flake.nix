@@ -156,6 +156,7 @@
           ps.rich
           ps.tqdm
           ps.pathspec
+          ps.pyyaml
         ];
 
         # Dev-only Python dependencies

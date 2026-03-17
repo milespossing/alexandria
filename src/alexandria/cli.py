@@ -68,6 +68,16 @@ def index(
 
     repo_root = Path(path).resolve()
 
+    # Load project-level config (.alexandria.yml) if present
+    from alexandria.config import PROJECT_CONFIG_FILE, load_project_config
+
+    load_project_config(repo_root, config)
+    if config.ignore_patterns:
+        console.print(
+            f"  Loaded [cyan]{len(config.ignore_patterns)}[/cyan] ignore pattern(s) "
+            f"from [dim]{PROJECT_CONFIG_FILE}[/dim]"
+        )
+
     # Verify services
     store = Store(config)
     if not store.is_available():
@@ -83,7 +93,11 @@ def index(
 
     # Discover files
     console.print(f"[bold]Discovering files[/bold] in {repo_root}...")
-    files = discover_files(repo_root, follow_symlinks=follow_symlinks)
+    files = discover_files(
+        repo_root,
+        follow_symlinks=follow_symlinks,
+        ignore_patterns=config.ignore_patterns,
+    )
     console.print(f"  Found [cyan]{len(files)}[/cyan] files")
 
     # Get existing file hashes for change detection

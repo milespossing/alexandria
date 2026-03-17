@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# Project-level config file name (placed at repo root).
+PROJECT_CONFIG_FILE = ".alexandria.yml"
 
 
 @dataclass
@@ -23,7 +30,7 @@ class Config:
     # Chunking
     chunk_lines: int = 50
     chunk_overlap: int = 10
-    max_chunk_chars: int = 6000  # ~2500 tokens at code tokenization rates, safe for nomic-embed-text's 8192 token window
+    max_chunk_chars: int = 3000  # ~2000 tokens, safe for nomic-embed-text's 2048 token ctx
     context_lines: int = 5  # lines of context around search results
 
     # Search
@@ -31,6 +38,7 @@ class Config:
 
     # File discovery
     follow_symlinks: bool = False
+    ignore_patterns: list[str] = field(default_factory=list)
 
     # Collection naming
     collection_prefix: str = "alexandria_"
@@ -38,6 +46,46 @@ class Config:
     def collection_name(self, context: str) -> str:
         """Return the Qdrant collection name for a context."""
         return f"{self.collection_prefix}{context}"
+
+
+def load_project_config(repo_root: Path, config: Config) -> Config:
+    """Load ``.alexandria.yml`` from *repo_root* and merge into *config*.
+
+    Supported keys:
+
+    - ``ignore`` — list of glob patterns to exclude from indexing.
+      Uses the same syntax as ``fd --exclude`` / ``.gitignore``.
+
+    If the file does not exist or is empty the config is returned unchanged.
+
+    Args:
+        repo_root: The repository root directory.
+        config: The existing Config to merge into.
+
+    Returns:
+        The (possibly updated) Config.
+    """
+    config_path = repo_root / PROJECT_CONFIG_FILE
+    if not config_path.is_file():
+        return config
+
+    import yaml  # type: ignore[import-untyped]  # lazy — only needed when the file exists
+
+    try:
+        raw = yaml.safe_load(config_path.read_text())
+    except Exception as exc:
+        log.warning("Failed to parse %s: %s", config_path, exc)
+        return config
+
+    if not isinstance(raw, dict):
+        return config
+
+    # ignore patterns
+    ignore = raw.get("ignore")
+    if isinstance(ignore, list):
+        config.ignore_patterns = [str(p) for p in ignore if p]
+
+    return config
 
 
 # Extension -> tree-sitter language name mapping
@@ -138,45 +186,100 @@ FILENAME_MAP: dict[str, str] = {
 # Maps language name -> set of node types.
 CHUNK_NODE_TYPES: dict[str, set[str]] = {
     "python": {"function_definition", "class_definition", "decorated_definition"},
-    "javascript": {"function_declaration", "class_declaration", "export_statement",
-                    "lexical_declaration", "expression_statement"},
-    "typescript": {"function_declaration", "class_declaration", "export_statement",
-                   "lexical_declaration", "expression_statement", "interface_declaration",
-                   "type_alias_declaration", "enum_declaration"},
-    "tsx": {"function_declaration", "class_declaration", "export_statement",
-            "lexical_declaration", "expression_statement", "interface_declaration",
-            "type_alias_declaration", "enum_declaration"},
+    "javascript": {
+        "function_declaration",
+        "class_declaration",
+        "export_statement",
+        "lexical_declaration",
+        "expression_statement",
+    },
+    "typescript": {
+        "function_declaration",
+        "class_declaration",
+        "export_statement",
+        "lexical_declaration",
+        "expression_statement",
+        "interface_declaration",
+        "type_alias_declaration",
+        "enum_declaration",
+    },
+    "tsx": {
+        "function_declaration",
+        "class_declaration",
+        "export_statement",
+        "lexical_declaration",
+        "expression_statement",
+        "interface_declaration",
+        "type_alias_declaration",
+        "enum_declaration",
+    },
     "go": {"function_declaration", "method_declaration", "type_declaration"},
-    "rust": {"function_item", "impl_item", "struct_item", "enum_item",
-             "trait_item", "mod_item", "type_item"},
-    "c": {"function_definition", "struct_specifier", "enum_specifier",
-          "type_definition", "declaration"},
-    "cpp": {"function_definition", "class_specifier", "struct_specifier",
-            "enum_specifier", "type_definition", "declaration",
-            "namespace_definition", "template_declaration"},
-    "java": {"class_declaration", "method_declaration", "interface_declaration",
-             "enum_declaration"},
+    "rust": {
+        "function_item",
+        "impl_item",
+        "struct_item",
+        "enum_item",
+        "trait_item",
+        "mod_item",
+        "type_item",
+    },
+    "c": {
+        "function_definition",
+        "struct_specifier",
+        "enum_specifier",
+        "type_definition",
+        "declaration",
+    },
+    "cpp": {
+        "function_definition",
+        "class_specifier",
+        "struct_specifier",
+        "enum_specifier",
+        "type_definition",
+        "declaration",
+        "namespace_definition",
+        "template_declaration",
+    },
+    "java": {
+        "class_declaration",
+        "method_declaration",
+        "interface_declaration",
+        "enum_declaration",
+    },
     "ruby": {"method", "class", "module", "singleton_method"},
     "lua": {"function_declaration", "function_definition", "local_function"},
     "nix": {"binding", "function_expression"},
     "bash": {"function_definition"},
     "elixir": {"call"},  # defmodule, def, defp are all `call` nodes
     "haskell": {"function", "type_alias", "newtype", "data"},
-    "scala": {"function_definition", "class_definition", "object_definition",
-              "trait_definition"},
+    "scala": {"function_definition", "class_definition", "object_definition", "trait_definition"},
     "kotlin": {"function_declaration", "class_declaration", "object_declaration"},
-    "csharp": {"method_declaration", "class_declaration", "interface_declaration",
-               "struct_declaration", "enum_declaration", "namespace_declaration"},
-    "swift": {"function_declaration", "class_declaration", "struct_declaration",
-              "enum_declaration", "protocol_declaration"},
+    "csharp": {
+        "method_declaration",
+        "class_declaration",
+        "interface_declaration",
+        "struct_declaration",
+        "enum_declaration",
+        "namespace_declaration",
+    },
+    "swift": {
+        "function_declaration",
+        "class_declaration",
+        "struct_declaration",
+        "enum_declaration",
+        "protocol_declaration",
+    },
     "zig": {"function_declaration", "container_declaration"},
 }
 
 # Default fallback: extract any named top-level children
 DEFAULT_CHUNK_NODE_TYPES: set[str] = {
-    "function_definition", "function_declaration",
-    "class_definition", "class_declaration",
-    "method_declaration", "method_definition",
+    "function_definition",
+    "function_declaration",
+    "class_definition",
+    "class_declaration",
+    "method_declaration",
+    "method_definition",
 }
 
 # Symbol name extraction: which child field holds the name

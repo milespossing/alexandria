@@ -70,8 +70,19 @@ def repo_root() -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _cleanup_test_context(test_store: Store) -> Generator[None]:
-    """Drop the test context before each test so tests start clean."""
-    test_store.drop_context(TEST_CONTEXT)
+def _cleanup_test_context(request: pytest.FixtureRequest) -> Generator[None]:
+    """Drop the test context before/after tests that use the store.
+
+    Only runs when the test actually depends on ``test_store`` (directly or
+    transitively).  Unit tests that don't need Qdrant are left alone.
+    """
+    # Only clean up if the test (or its class) uses the test_store fixture.
+    fixture_names = request.fixturenames
+    if "test_store" not in fixture_names:
+        yield
+        return
+
+    store: Store = request.getfixturevalue("test_store")
+    store.drop_context(TEST_CONTEXT)
     yield
-    test_store.drop_context(TEST_CONTEXT)
+    store.drop_context(TEST_CONTEXT)
