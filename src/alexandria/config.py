@@ -20,17 +20,33 @@ class Config:
     # Qdrant
     qdrant_url: str = os.environ.get("QDRANT_URL", "http://localhost:6333")
 
+    # Embedding backend: "ollama" (default) or "openai" (any OpenAI-compatible API)
+    embed_backend: str = os.environ.get("ALEXANDRIA_EMBED_BACKEND", "ollama")
+
     # Ollama
     ollama_host: str = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
     embed_model: str = os.environ.get("ALEXANDRIA_EMBED_MODEL", "nomic-embed-text")
 
-    # Embedding dimensions for nomic-embed-text
-    embed_dim: int = 768
+    # OpenAI-compatible API settings (used when embed_backend == "openai")
+    embed_api_url: str = os.environ.get(
+        "ALEXANDRIA_EMBED_API_URL", "https://models.github.ai/inference"
+    )
+    embed_api_key: str = os.environ.get(
+        "ALEXANDRIA_EMBED_API_KEY",
+        os.environ.get("GITHUB_TOKEN", ""),
+    )
+
+    # Embedding dimensions — 768 for nomic-embed-text, 1536 for text-embedding-3-small,
+    # 3072 for text-embedding-3-large. Set to 0 to auto-detect on first embed call.
+    embed_dim: int = int(os.environ.get("ALEXANDRIA_EMBED_DIM", "0"))
 
     # Chunking
     chunk_lines: int = 50
     chunk_overlap: int = 10
-    max_chunk_chars: int = 3000  # ~2000 tokens, safe for nomic-embed-text's 2048 token ctx
+    # max_chunk_chars: 0 means "auto-select based on embed backend" (see create_embedder).
+    #   - ollama  -> 3000 (~2000 tokens, safe for nomic-embed-text's 2048 token ctx)
+    #   - openai  -> 6000 (~4000 tokens, text-embedding-3-* supports 8191 tokens)
+    max_chunk_chars: int = int(os.environ.get("ALEXANDRIA_MAX_CHUNK_CHARS", "0"))
     context_lines: int = 5  # lines of context around search results
 
     # Search
@@ -46,6 +62,31 @@ class Config:
     def collection_name(self, context: str) -> str:
         """Return the Qdrant collection name for a context."""
         return f"{self.collection_prefix}{context}"
+
+    def resolve_embed_dim(self) -> int:
+        """Return the embedding dimension, falling back to known model defaults.
+
+        If ``embed_dim`` is already set (> 0) it is returned as-is.
+        Otherwise we look up the model name in ``KNOWN_EMBED_DIMS``.
+        If the model is unknown we return 0 (meaning "detect at runtime").
+        """
+        if self.embed_dim > 0:
+            return self.embed_dim
+        return KNOWN_EMBED_DIMS.get(self.embed_model, 0)
+
+
+# Well-known embedding dimensions keyed by model name.
+KNOWN_EMBED_DIMS: dict[str, int] = {
+    "nomic-embed-text": 768,
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+    "cohere-embed-v4": 1024,
+    # GitHub Models uses {publisher}/{model} format.
+    "openai/text-embedding-3-small": 1536,
+    "openai/text-embedding-3-large": 3072,
+    "openai/text-embedding-ada-002": 1536,
+}
 
 
 def load_project_config(repo_root: Path, config: Config) -> Config:

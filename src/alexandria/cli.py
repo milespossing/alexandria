@@ -49,7 +49,6 @@ def index(
     """Index a codebase into a named vector database context."""
     from alexandria.chunker import chunk_file
     from alexandria.discovery import discover_files
-    from alexandria.embedder import Embedder
     from alexandria.store import Store
 
     # Wire Python logging through Rich so embedder warnings render nicely.
@@ -85,10 +84,22 @@ def index(
         console.print("Start Qdrant first: [bold]qdrant[/bold]")
         sys.exit(1)
 
-    embedder = Embedder(config)
+    from alexandria.embedder import create_embedder
+
+    embedder = create_embedder(config)
     if not embedder.is_available():
-        console.print(f"[red]Error:[/red] Ollama model '{config.embed_model}' not available.")
-        console.print("Run: [bold]alexandria setup[/bold]")
+        if config.embed_backend == "openai":
+            console.print(
+                f"[red]Error:[/red] Cannot reach OpenAI-compatible API "
+                f"at {config.embed_api_url} with model '{config.embed_model}'."
+            )
+            console.print(
+                "Check ALEXANDRIA_EMBED_API_URL, ALEXANDRIA_EMBED_API_KEY, "
+                "and ALEXANDRIA_EMBED_MODEL."
+            )
+        else:
+            console.print(f"[red]Error:[/red] Ollama model '{config.embed_model}' not available.")
+            console.print("Run: [bold]alexandria setup[/bold]")
         sys.exit(1)
 
     # Discover files
@@ -256,7 +267,7 @@ def list_contexts() -> None:
 @main.command()
 def setup() -> None:
     """Pull the Ollama embedding model and verify Qdrant connectivity."""
-    from alexandria.embedder import Embedder
+    from alexandria.embedder import Embedder, create_embedder
     from alexandria.store import Store
 
     config = Config()
@@ -272,20 +283,44 @@ def setup() -> None:
         console.print("  Start Qdrant: [bold]qdrant[/bold]")
         sys.exit(1)
 
-    # Check Ollama and pull model
-    console.print(f"[bold]Checking Ollama model '{config.embed_model}'...[/bold]", end=" ")
-    embedder = Embedder(config)
-    if embedder.is_available():
-        console.print("[green]already pulled[/green]")
-    else:
-        console.print("[yellow]pulling...[/yellow]")
-        try:
-            embedder.pull_model()
-            console.print(f"  [green]Pulled {config.embed_model}[/green]")
-        except Exception as e:
-            console.print(f"  [red]Failed to pull model:[/red] {e}")
-            console.print("  Make sure Ollama is running: [bold]ollama serve[/bold]")
+    if config.embed_backend == "openai":
+        # OpenAI-compatible backend — no model pull needed, just verify connectivity.
+        console.print(
+            f"[bold]Checking OpenAI-compatible API[/bold] "
+            f"({config.embed_api_url}, model '{config.embed_model}')...",
+            end=" ",
+        )
+        embedder = create_embedder(config)
+        if embedder.is_available():
+            console.print("[green]OK[/green]")
+            dim = config.resolve_embed_dim()
+            if dim > 0:
+                console.print(f"  Embedding dimension: [cyan]{dim}[/cyan]")
+        else:
+            console.print("[red]FAILED[/red]")
+            console.print(f"  Cannot reach API at {config.embed_api_url}")
+            if not config.embed_api_key:
+                console.print(
+                    "  [yellow]No API key set.[/yellow] "
+                    "Set ALEXANDRIA_EMBED_API_KEY or GITHUB_TOKEN."
+                )
             sys.exit(1)
+    else:
+        # Ollama backend — pull model if needed.
+        console.print(f"[bold]Checking Ollama model '{config.embed_model}'...[/bold]", end=" ")
+        embedder = create_embedder(config)
+        assert isinstance(embedder, Embedder)  # guaranteed for ollama backend
+        if embedder.is_available():
+            console.print("[green]already pulled[/green]")
+        else:
+            console.print("[yellow]pulling...[/yellow]")
+            try:
+                embedder.pull_model()
+                console.print(f"  [green]Pulled {config.embed_model}[/green]")
+            except Exception as e:
+                console.print(f"  [red]Failed to pull model:[/red] {e}")
+                console.print("  Make sure Ollama is running: [bold]ollama serve[/bold]")
+                sys.exit(1)
 
     console.print("\n[green]Setup complete![/green]")
 

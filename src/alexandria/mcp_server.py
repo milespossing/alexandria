@@ -11,7 +11,7 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP
 
 from alexandria.config import Config
-from alexandria.embedder import Embedder
+from alexandria.embedder import BaseEmbedder, create_embedder
 from alexandria.store import SearchResult, Store
 
 mcp = FastMCP(
@@ -27,7 +27,7 @@ mcp = FastMCP(
 # These are initialized lazily on first use
 _config: Config | None = None
 _store: Store | None = None
-_embedder: Embedder | None = None
+_embedder: BaseEmbedder | None = None
 
 
 def _get_config() -> Config:
@@ -44,10 +44,10 @@ def _get_store() -> Store:
     return _store
 
 
-def _get_embedder() -> Embedder:
+def _get_embedder() -> BaseEmbedder:
     global _embedder
     if _embedder is None:
-        _embedder = Embedder(_get_config())
+        _embedder = create_embedder(_get_config())
     return _embedder
 
 
@@ -160,14 +160,14 @@ def list_contexts() -> str:
     contexts = store.list_contexts()
 
     if not contexts:
-        return "No contexts indexed. Use `alexandria index --context NAME PATH` to index a codebase."
+        return (
+            "No contexts indexed. Use `alexandria index --context NAME PATH` to index a codebase."
+        )
 
     lines = ["## Indexed Contexts", ""]
     for ctx in sorted(contexts):
         stats = store.get_context_stats(ctx)
-        lines.append(
-            f"- **{ctx}**: {stats['points']} chunks indexed (status: {stats['status']})"
-        )
+        lines.append(f"- **{ctx}**: {stats['points']} chunks indexed (status: {stats['status']})")
 
     return "\n".join(lines)
 

@@ -51,10 +51,18 @@ class Store:
         collections = self.client.get_collections().collections
         existing = {c.name for c in collections}
         if name not in existing:
+            dim = self.config.resolve_embed_dim()
+            if dim <= 0:
+                dim = self.config.embed_dim  # fallback to whatever is set
+            if dim <= 0:
+                raise RuntimeError(
+                    "Cannot create Qdrant collection: embedding dimension is unknown. "
+                    "Set ALEXANDRIA_EMBED_DIM or run 'alexandria setup' first."
+                )
             self.client.create_collection(
                 collection_name=name,
                 vectors_config=VectorParams(
-                    size=self.config.embed_dim,
+                    size=dim,
                     distance=Distance.COSINE,
                 ),
             )
@@ -168,9 +176,7 @@ class Store:
                 FieldCondition(key="language", match=MatchValue(value=language_filter))
             )
         if file_filter:
-            must_conditions.append(
-                FieldCondition(key="file", match=MatchValue(value=file_filter))
-            )
+            must_conditions.append(FieldCondition(key="file", match=MatchValue(value=file_filter)))
 
         query_filter = Filter(must=must_conditions) if must_conditions else None
 
@@ -231,11 +237,7 @@ class Store:
         """List all context names (strips the collection prefix)."""
         collections = self.client.get_collections().collections
         prefix = self.config.collection_prefix
-        return [
-            c.name[len(prefix) :]
-            for c in collections
-            if c.name.startswith(prefix)
-        ]
+        return [c.name[len(prefix) :] for c in collections if c.name.startswith(prefix)]
 
     def get_context_stats(self, context: str) -> dict[str, int | str]:
         """Get stats for a context: point count, file count, etc."""
