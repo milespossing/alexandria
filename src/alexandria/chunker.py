@@ -16,10 +16,10 @@ from tree_sitter_language_pack import get_parser
 from alexandria.config import (
     CHUNK_NODE_TYPES,
     DEFAULT_CHUNK_NODE_TYPES,
-    Config,
     EXTENSION_MAP,
     FILENAME_MAP,
     NAME_FIELDS,
+    Config,
 )
 
 
@@ -68,8 +68,10 @@ def _get_symbol_name(node: object) -> str | None:
         for child in named_children:
             child_type = getattr(child, "type", "")
             if child_type in (
-                "function_definition", "class_definition",
-                "function_declaration", "class_declaration",
+                "function_definition",
+                "class_definition",
+                "function_declaration",
+                "class_declaration",
             ):
                 return _get_symbol_name(child)
 
@@ -105,11 +107,15 @@ def _extract_preceding_comments(
     idx = start_line_0idx - 1
     while idx >= 0:
         stripped = source_lines[idx].strip()
-        if stripped.startswith("#") or stripped.startswith("//") or stripped.startswith("*"):
-            idx -= 1
-        elif stripped.startswith("/*") or stripped.endswith("*/"):
-            idx -= 1
-        elif stripped.startswith('"""') or stripped.startswith("'''"):
+        if (
+            stripped.startswith("#")
+            or stripped.startswith("//")
+            or stripped.startswith("*")
+            or stripped.startswith("/*")
+            or stripped.endswith("*/")
+            or stripped.startswith('"""')
+            or stripped.startswith("'''")
+        ):
             idx -= 1
         elif stripped == "":
             # Allow one blank line between comment block and definition
@@ -122,12 +128,21 @@ def _extract_preceding_comments(
     return idx + 1
 
 
-def _split_oversized_chunk(chunk: Chunk, max_chars: int, window: int = 50, overlap: int = 10) -> list[Chunk]:
+def _split_oversized_chunk(
+    chunk: Chunk,
+    max_chars: int,
+    window: int = 50,
+    overlap: int = 10,
+) -> list[Chunk]:
     """Split a chunk that exceeds max_chars into smaller sub-chunks.
 
     Uses the sliding-window approach on the chunk's lines, preserving
-    symbol name and other metadata.  Returns a list of one or more chunks.
-    If the chunk is within limits, returns it unchanged as a single-element list.
+    symbol name and other metadata.  If line-based splitting still
+    produces oversized chunks (e.g. minified files with very long lines),
+    falls back to hard character-level splitting.
+
+    Returns a list of one or more chunks.  If the chunk is within
+    limits, returns it unchanged as a single-element list.
     """
     if len(chunk.text) <= max_chars:
         return [chunk]
@@ -135,9 +150,9 @@ def _split_oversized_chunk(chunk: Chunk, max_chars: int, window: int = 50, overl
     lines = chunk.text.splitlines()
 
     # If the window itself would produce chunks that are still too large,
-    # shrink the window until it fits (but never below 5 lines).
+    # shrink the window until it fits (but never below 1 line).
     effective_window = window
-    while effective_window > 5:
+    while effective_window > 1:
         sample = "\n".join(lines[:effective_window])
         if len(sample) <= max_chars:
             break
@@ -153,31 +168,56 @@ def _split_oversized_chunk(chunk: Chunk, max_chars: int, window: int = 50, overl
         text = "\n".join(lines[i:end])
 
         if text.strip():
-            # Compute sub-chunk line numbers relative to the file
-            sub_start_line = chunk.start_line + i
-            sub_end_line = chunk.start_line + end - 1
+            # If this sub-chunk is STILL too large (e.g. a single very long
+            # line), split it by character count.
+            fragments = _hard_split(text, max_chars) if len(text) > max_chars else [text]
 
-            # Annotate symbol with part number so we know it's a fragment
-            symbol = f"{chunk.symbol}[part {part}]" if chunk.symbol else None
+            for frag in fragments:
+                sub_start_line = chunk.start_line + i
+                sub_end_line = chunk.start_line + end - 1
+                symbol = f"{chunk.symbol}[part {part}]" if chunk.symbol else None
 
-            sub_chunks.append(
-                Chunk(
-                    text=text,
-                    file=chunk.file,
-                    start_line=sub_start_line,
-                    end_line=sub_end_line,
-                    symbol=symbol,
-                    language=chunk.language,
-                    file_hash=chunk.file_hash,
+                sub_chunks.append(
+                    Chunk(
+                        text=frag,
+                        file=chunk.file,
+                        start_line=sub_start_line,
+                        end_line=sub_end_line,
+                        symbol=symbol,
+                        language=chunk.language,
+                        file_hash=chunk.file_hash,
+                    )
                 )
-            )
-            part += 1
+                part += 1
 
         if end >= len(lines):
             break
         i += step
 
     return sub_chunks if sub_chunks else [chunk]
+
+
+def _hard_split(text: str, max_chars: int) -> list[str]:
+    """Split text by character count when line-based splitting is insufficient.
+
+    Tries to break at whitespace boundaries within the limit.  Falls back to
+    a hard character cut if no whitespace is found.
+    """
+    fragments: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        # Try to find a whitespace boundary to break at
+        cut = remaining.rfind(" ", 0, max_chars)
+        if cut <= 0:
+            cut = remaining.rfind("\t", 0, max_chars)
+        if cut <= 0:
+            # No whitespace — hard cut
+            cut = max_chars
+        fragments.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip()
+    if remaining.strip():
+        fragments.append(remaining)
+    return fragments
 
 
 def chunk_file_treesitter(
@@ -245,7 +285,10 @@ def chunk_file_treesitter(
         for c in chunks:
             final.extend(
                 _split_oversized_chunk(
-                    c, config.max_chunk_chars, config.chunk_lines, config.chunk_overlap,
+                    c,
+                    config.max_chunk_chars,
+                    config.chunk_lines,
+                    config.chunk_overlap,
                 )
             )
         return final
@@ -303,7 +346,10 @@ def chunk_file_sliding_window(
         for c in chunks:
             final.extend(
                 _split_oversized_chunk(
-                    c, config.max_chunk_chars, config.chunk_lines, config.chunk_overlap,
+                    c,
+                    config.max_chunk_chars,
+                    config.chunk_lines,
+                    config.chunk_overlap,
                 )
             )
         return final

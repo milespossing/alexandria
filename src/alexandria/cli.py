@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import sys
 from pathlib import Path
 
@@ -50,6 +51,14 @@ def index(
     from alexandria.discovery import discover_files
     from alexandria.embedder import Embedder
     from alexandria.store import Store
+
+    # Wire Python logging through Rich so embedder warnings render nicely.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(message)s",
+        handlers=[logging.StreamHandler(console.file)],
+        force=True,
+    )
 
     config = Config(
         chunk_lines=chunk_lines,
@@ -121,7 +130,12 @@ def index(
         if not chunks:
             return 0
         texts = [c.text for c in chunks]
-        vectors = embedder.embed_batch(texts, batch_size=embed_batch_size)
+        labels = [f"{c.file}:{c.start_line}-{c.end_line}" for c in chunks]
+        vectors = embedder.embed_batch(
+            texts,
+            batch_size=embed_batch_size,
+            labels=labels,
+        )
         return store.upsert_chunks(context, chunks, vectors)
 
     with Progress(
