@@ -376,6 +376,132 @@ class TestOpenAIEmbedBatch:
 
 
 # ---------------------------------------------------------------------------
+# Token-budget batching
+# ---------------------------------------------------------------------------
+
+
+class TestTokenBudgetBatching:
+    """Test _split_by_token_budget and token-aware embed_batch."""
+
+    def test_estimate_tokens(self) -> None:
+        embedder = OpenAIEmbedder(_openai_config())
+        # 400 chars -> ~100 tokens
+        assert embedder._estimate_tokens("a" * 400) == 100
+        # Empty -> minimum of 1
+        assert embedder._estimate_tokens("") == 1
+
+    def test_split_all_fit_in_one_batch(self) -> None:
+        config = _openai_config(max_tokens_per_request=1000)
+        embedder = OpenAIEmbedder(config)
+        # 3 texts of 100 chars each -> ~25 tokens each -> 75 total, fits in 1000
+        texts = ["a" * 100, "b" * 100, "c" * 100]
+        batches = embedder._split_by_token_budget(texts)
+        assert len(batches) == 1
+        assert batches[0] == [0, 1, 2]
+
+    def test_split_into_multiple_batches(self) -> None:
+        config = _openai_config(max_tokens_per_request=100)
+        embedder = OpenAIEmbedder(config)
+        # 3 texts of 200 chars each -> ~50 tokens each
+        # Budget=100 -> 2 fit per batch, then 1 in the last
+        texts = ["a" * 200, "b" * 200, "c" * 200]
+        batches = embedder._split_by_token_budget(texts)
+        assert len(batches) == 2
+        assert batches[0] == [0, 1]
+        assert batches[1] == [2]
+
+    def test_split_oversized_single_text(self) -> None:
+        config = _openai_config(max_tokens_per_request=10)
+        embedder = OpenAIEmbedder(config)
+        # 1 text of 200 chars -> ~50 tokens, way over budget of 10
+        # Should still get its own batch (API will handle the error)
+        texts = ["a" * 200]
+        batches = embedder._split_by_token_budget(texts)
+        assert len(batches) == 1
+        assert batches[0] == [0]
+
+    def test_split_no_budget(self) -> None:
+        config = _openai_config(max_tokens_per_request=0)
+        embedder = OpenAIEmbedder(config)
+        texts = ["a" * 200] * 100
+        batches = embedder._split_by_token_budget(texts)
+        assert len(batches) == 1
+        assert len(batches[0]) == 100
+
+    @patch("alexandria.embedder.urllib.request.urlopen")
+    def test_embed_batch_uses_token_budget(self, mock_urlopen_fn: MagicMock) -> None:
+        """With token budget, texts are grouped by estimated tokens, not count."""
+        call_count = 0
+
+        def side_effect(req: Any, timeout: int = 120) -> MagicMock:
+            nonlocal call_count
+            body = json.loads(req.data)
+            n = len(body["input"])
+            vecs = [[float(call_count)] * 4 for _ in range(n)]
+            call_count += 1
+            return _mock_urlopen(_make_response(vecs))
+
+        mock_urlopen_fn.side_effect = side_effect
+
+        # Budget of 100 tokens, 3 texts of ~50 tokens each -> 2 batches
+        config = _openai_config(max_tokens_per_request=100)
+        embedder = OpenAIEmbedder(config)
+        result = embedder.embed_batch(["a" * 200, "b" * 200, "c" * 200])
+
+        assert len(result) == 3
+        assert mock_urlopen_fn.call_count == 2
+
+    @patch("alexandria.embedder.urllib.request.urlopen")
+    def test_embed_batch_fallback_without_budget(self, mock_urlopen_fn: MagicMock) -> None:
+        """Without token budget, falls back to fixed batch_size splitting."""
+        call_count = 0
+
+        def side_effect(req: Any, timeout: int = 120) -> MagicMock:
+            nonlocal call_count
+            body = json.loads(req.data)
+            n = len(body["input"])
+            vecs = [[float(call_count)] * 4 for _ in range(n)]
+            call_count += 1
+            return _mock_urlopen(_make_response(vecs))
+
+        mock_urlopen_fn.side_effect = side_effect
+
+        # No token budget, batch_size=2, 3 texts -> 2 calls
+        config = _openai_config(max_tokens_per_request=0)
+        embedder = OpenAIEmbedder(config)
+        result = embedder.embed_batch(["a", "b", "c"], batch_size=2)
+
+        assert len(result) == 3
+        assert mock_urlopen_fn.call_count == 2
+
+    def test_factory_sets_max_tokens(self) -> None:
+        """create_embedder sets max_tokens_per_request for the OpenAI backend."""
+        config = Config(
+            embed_backend="openai",
+            embed_api_url="https://example.com",
+            embed_api_key="key",
+            embed_model="text-embedding-3-small",
+            embed_dim=1536,
+            max_tokens_per_request=0,
+        )
+        create_embedder(config)
+        assert config.max_tokens_per_request == 64_000
+
+    def test_factory_preserves_explicit_max_tokens(self) -> None:
+        """User-set max_tokens_per_request is not overridden."""
+        config = Config(
+            embed_backend="openai",
+            embed_api_url="https://example.com",
+            embed_api_key="key",
+            embed_model="text-embedding-3-small",
+            embed_dim=1536,
+            max_tokens_per_request=32_000,
+        )
+        create_embedder(config)
+        assert config.max_tokens_per_request == 32_000
+
+
+# ---------------------------------------------------------------------------
 # OpenAIEmbedder.is_available
 # ---------------------------------------------------------------------------
 

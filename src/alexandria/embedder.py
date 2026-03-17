@@ -216,6 +216,41 @@ class OpenAIEmbedder(BaseEmbedder):
 
     # -- internal helpers ---------------------------------------------------
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Estimate the token count for *text* using a chars/4 heuristic."""
+        return max(len(text) // 4, 1)
+
+    def _split_by_token_budget(self, texts: list[str]) -> list[list[int]]:
+        """Partition *texts* into batches that fit within the token budget.
+
+        Each batch's estimated total tokens will not exceed
+        ``config.max_tokens_per_request``.  If a single text exceeds the
+        budget on its own it gets its own batch (the API will truncate or
+        reject it, and the fallback retry handles the error).
+
+        Returns a list of index-lists, e.g. ``[[0,1,2], [3,4], [5]]``.
+        """
+        budget = self.config.max_tokens_per_request
+        if budget <= 0:
+            # No budget limit — return one batch with all indices.
+            return [list(range(len(texts)))]
+
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_tokens = 0
+        for i, text in enumerate(texts):
+            est = self._estimate_tokens(text)
+            if current_batch and current_tokens + est > budget:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+            current_batch.append(i)
+            current_tokens += est
+        if current_batch:
+            batches.append(current_batch)
+        return batches
+
     def _request(self, texts: list[str]) -> list[list[float]]:
         """Send a single ``POST /v1/embeddings`` request with retry on 429.
 
@@ -313,40 +348,54 @@ class OpenAIEmbedder(BaseEmbedder):
     ) -> list[list[float]]:
         """Embed a batch of texts via the OpenAI-compatible API.
 
-        Sends texts in sub-batches of *batch_size*.  If a batch fails, retries
-        one text at a time (same resilience pattern as the Ollama backend).
+        Texts are grouped into sub-batches that fit within the configured
+        token budget (``config.max_tokens_per_request``).  If the budget is
+        not set, falls back to fixed-size *batch_size* splitting.
+
+        If a batch request fails, it is retried one text at a time (same
+        resilience pattern as the Ollama backend).
 
         Args:
             texts: The texts to embed.
-            batch_size: Max texts per API request.  Defaults to 64.
+            batch_size: Max texts per API request when no token budget is set.
             labels: Optional human-readable labels for error messages.
         """
-        all_embeddings: list[list[float]] = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
+        all_embeddings: list[list[float]] = [[] for _ in texts]
+
+        if self.config.max_tokens_per_request > 0:
+            index_batches = self._split_by_token_budget(texts)
+        else:
+            # Fallback: fixed-count batches.
+            index_batches = [
+                list(range(i, min(i + batch_size, len(texts))))
+                for i in range(0, len(texts), batch_size)
+            ]
+
+        for idx_batch in index_batches:
+            batch_texts = [texts[i] for i in idx_batch]
             try:
-                all_embeddings.extend(self._request(batch))
+                vecs = self._request(batch_texts)
+                for pos, idx in enumerate(idx_batch):
+                    all_embeddings[idx] = vecs[pos]
             except OpenAIEmbedError as exc:
                 log.warning(
-                    "Batch embed failed (offset %d, size %d): %s  — retrying individually",
-                    i,
-                    len(batch),
+                    "Batch embed failed (size %d): %s  — retrying individually",
+                    len(batch_texts),
                     exc,
                 )
-                for j, text in enumerate(batch):
-                    idx = i + j
+                for idx in idx_batch:
                     label = labels[idx] if labels else f"offset {idx}"
                     try:
-                        vec = self.embed(text)
-                        all_embeddings.append(vec)
+                        vec = self.embed(texts[idx])
+                        all_embeddings[idx] = vec
                     except OpenAIEmbedError as inner:
                         log.warning(
                             "Failed to embed chunk (%s, %d chars): %s",
                             label,
-                            len(text),
+                            len(texts[idx]),
                             inner,
                         )
-                        all_embeddings.append(self._zero_vector())
+                        all_embeddings[idx] = self._zero_vector()
         return all_embeddings
 
     def is_available(self) -> bool:
@@ -365,6 +414,10 @@ class OpenAIEmbedder(BaseEmbedder):
 # Default max_chunk_chars per backend.  Applied when config.max_chunk_chars == 0.
 _OLLAMA_MAX_CHUNK_CHARS = 3000  # ~2000 tokens — safe for nomic-embed-text (2048 tok ctx)
 _OPENAI_MAX_CHUNK_CHARS = 6000  # ~4000 tokens — text-embedding-3-* supports 8191 tok ctx
+
+# Default max_tokens_per_request for the OpenAI backend.
+# GitHub Models free tier allows 64 000 tokens per embedding request.
+_OPENAI_MAX_TOKENS_PER_REQUEST = 64_000
 
 
 def create_embedder(config: Config) -> BaseEmbedder:
@@ -412,6 +465,8 @@ def create_embedder(config: Config) -> BaseEmbedder:
             # else: will be auto-detected on first embed call
         if config.max_chunk_chars <= 0:
             config.max_chunk_chars = _OPENAI_MAX_CHUNK_CHARS
+        if config.max_tokens_per_request <= 0:
+            config.max_tokens_per_request = _OPENAI_MAX_TOKENS_PER_REQUEST
         return OpenAIEmbedder(config)
 
     raise ValueError(

@@ -2,12 +2,17 @@
 
 Each context gets its own collection named `alexandria_{context}`.
 Metadata stored per point: file, start_line, end_line, symbol, language, file_hash.
+
+Collection-level metadata (``collection.config.metadata``) stores the
+embedding model info so that query-time can auto-select the right embedder.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -20,7 +25,9 @@ from qdrant_client.models import (
 )
 
 from alexandria.chunker import Chunk
-from alexandria.config import Config
+from alexandria.config import CollectionEmbedInfo, Config
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -38,6 +45,10 @@ class SearchResult:
     context_after: str  # lines after the chunk
 
 
+class VectorDimensionError(RuntimeError):
+    """Raised when the query vector dimension doesn't match the collection."""
+
+
 class Store:
     """Qdrant-backed vector store with per-context collections."""
 
@@ -46,7 +57,12 @@ class Store:
         self.client = QdrantClient(url=config.qdrant_url)
 
     def _ensure_collection(self, context: str) -> None:
-        """Create the collection if it doesn't exist."""
+        """Create the collection if it doesn't exist.
+
+        Stores embedding model metadata (backend, model name, dimension)
+        in the collection's ``metadata`` dict so that query-time can
+        auto-select the correct embedder.
+        """
         name = self.config.collection_name(context)
         collections = self.client.get_collections().collections
         existing = {c.name for c in collections}
@@ -59,13 +75,123 @@ class Store:
                     "Cannot create Qdrant collection: embedding dimension is unknown. "
                     "Set ALEXANDRIA_EMBED_DIM or run 'alexandria setup' first."
                 )
+            metadata: dict[str, Any] = {
+                "embed_backend": self.config.embed_backend,
+                "embed_model": self.config.embed_model,
+                "embed_dim": dim,
+            }
             self.client.create_collection(
                 collection_name=name,
                 vectors_config=VectorParams(
                     size=dim,
                     distance=Distance.COSINE,
                 ),
+                metadata=metadata,
             )
+
+    def get_collection_embed_info(self, context: str) -> CollectionEmbedInfo | None:
+        """Read the embedding metadata for a context's collection.
+
+        Returns ``None`` if the collection does not exist.  If the collection
+        exists but has no stored metadata (indexed before this feature was
+        added), the dimension is read from the vector config and the model
+        fields are set to empty strings — callers should fall back to
+        :func:`~alexandria.config.DIM_TO_DEFAULT_MODEL` for auto-detection.
+
+        Args:
+            context: The context name.
+
+        Returns:
+            A :class:`CollectionEmbedInfo` or ``None``.
+        """
+        name = self.config.collection_name(context)
+        try:
+            info = self.client.get_collection(name)
+        except Exception:
+            return None
+
+        # Read vector dimension from the collection's vector params.
+        dim = 0
+        vectors_config = info.config.params.vectors
+        if isinstance(vectors_config, VectorParams):
+            dim = vectors_config.size
+        elif isinstance(vectors_config, dict):
+            # Named vectors — grab the first (Alexandria uses the default).
+            for vp in vectors_config.values():
+                if isinstance(vp, VectorParams):
+                    dim = vp.size
+                    break
+
+        # Read stored metadata (may be absent on older collections).
+        meta: dict[str, Any] = {}
+        if info.config.metadata and isinstance(info.config.metadata, dict):
+            meta = info.config.metadata
+
+        return CollectionEmbedInfo(
+            embed_backend=str(meta.get("embed_backend", "")),
+            embed_model=str(meta.get("embed_model", "")),
+            embed_dim=int(meta.get("embed_dim", dim)),
+        )
+
+    def set_collection_metadata(
+        self,
+        context: str,
+        *,
+        embed_backend: str,
+        embed_model: str,
+        embed_dim: int | None = None,
+    ) -> CollectionEmbedInfo:
+        """Write or update embedding metadata on an existing collection.
+
+        This is the escape-hatch for collections that were indexed before
+        metadata storage existed, or when the user needs to manually
+        correct the stored model info (e.g. after migrating embedders).
+
+        If *embed_dim* is ``None`` the dimension is read from the
+        collection's vector config so it stays in sync.
+
+        Args:
+            context: The context name.
+            embed_backend: ``"ollama"`` or ``"openai"``.
+            embed_model: Model name (e.g. ``"text-embedding-3-small"``).
+            embed_dim: Override dimension (default: read from collection).
+
+        Returns:
+            The resulting :class:`CollectionEmbedInfo`.
+
+        Raises:
+            RuntimeError: If the collection does not exist.
+        """
+        name = self.config.collection_name(context)
+
+        # Read current dim from the collection if not explicitly given.
+        if embed_dim is None:
+            existing = self.get_collection_embed_info(context)
+            if existing is None:
+                raise RuntimeError(
+                    f"Collection for context '{context}' does not exist. "
+                    f"Index it first with: alex index -c {context} PATH"
+                )
+            embed_dim = existing.embed_dim
+
+        metadata: dict[str, Any] = {
+            "embed_backend": embed_backend,
+            "embed_model": embed_model,
+            "embed_dim": embed_dim,
+        }
+        self.client.update_collection(collection_name=name, metadata=metadata)
+        log.info(
+            "Updated metadata for %s: backend=%s model=%s dim=%d",
+            context,
+            embed_backend,
+            embed_model,
+            embed_dim,
+        )
+        return CollectionEmbedInfo(
+            embed_backend=embed_backend,
+            embed_model=embed_model,
+            embed_dim=embed_dim,
+        )
 
     def upsert_chunks(
         self,
@@ -81,7 +207,7 @@ class Store:
         name = self.config.collection_name(context)
 
         points = []
-        for chunk, vector in zip(chunks, vectors):
+        for chunk, vector in zip(chunks, vectors, strict=True):
             points.append(
                 PointStruct(
                     id=chunk.id,
@@ -159,15 +285,42 @@ class Store:
     ) -> list[SearchResult]:
         """Search a context for similar code chunks.
 
+        Validates that the query vector's dimension matches the collection's
+        stored dimension before sending the request to Qdrant — producing a
+        clear, actionable error instead of a cryptic Qdrant 400.
+
         Args:
             context: The context name to search in.
             query_vector: The embedding of the search query.
             limit: Max results (defaults to config.search_limit).
             file_filter: Optional glob/suffix filter on file paths.
             language_filter: Optional language filter.
+
+        Raises:
+            VectorDimensionError: If the query vector size differs from
+                the collection's expected dimension.
         """
         name = self.config.collection_name(context)
         n = limit or self.config.search_limit
+
+        # --- Dimension validation -------------------------------------------
+        embed_info = self.get_collection_embed_info(context)
+        if embed_info is not None:
+            collection_dim = embed_info.embed_dim
+            query_dim = len(query_vector)
+            if collection_dim > 0 and query_dim != collection_dim:
+                model_hint = embed_info.embed_model or "unknown model"
+                backend_hint = embed_info.embed_backend or "unknown backend"
+                raise VectorDimensionError(
+                    f"Vector dimension mismatch for context '{context}': "
+                    f"collection has {collection_dim}-dim vectors "
+                    f"(indexed with {backend_hint}/{model_hint}) "
+                    f"but the current embedder produced a {query_dim}-dim query vector. "
+                    f"Fix: set ALEXANDRIA_EMBED_BACKEND and ALEXANDRIA_EMBED_MODEL to "
+                    f"match the index, or run: "
+                    f"alex set-model -c {context} --backend {backend_hint} "
+                    f"--model {model_hint}"
+                )
 
         # Build optional filters
         must_conditions = []
@@ -240,15 +393,21 @@ class Store:
         return [c.name[len(prefix) :] for c in collections if c.name.startswith(prefix)]
 
     def get_context_stats(self, context: str) -> dict[str, int | str]:
-        """Get stats for a context: point count, file count, etc."""
+        """Get stats for a context: point count, status, and embedding info."""
         name = self.config.collection_name(context)
         try:
             info = self.client.get_collection(name)
-            return {
+            stats: dict[str, int | str] = {
                 "context": context,
                 "points": info.points_count or 0,
                 "status": str(info.status),
             }
+            embed_info = self.get_collection_embed_info(context)
+            if embed_info is not None:
+                stats["embed_backend"] = embed_info.embed_backend or "—"
+                stats["embed_model"] = embed_info.embed_model or "—"
+                stats["embed_dim"] = embed_info.embed_dim
+            return stats
         except Exception:
             return {"context": context, "points": 0, "status": "not found"}
 

@@ -49,6 +49,11 @@ class Config:
     max_chunk_chars: int = int(os.environ.get("ALEXANDRIA_MAX_CHUNK_CHARS", "0"))
     context_lines: int = 5  # lines of context around search results
 
+    # Maximum tokens per embedding API request.  0 means "no limit" (Ollama is local
+    # so there is no external cap).  For GitHub Models / OpenAI the free tier allows
+    # 64 000 tokens per request — set via create_embedder() when embed_backend == "openai".
+    max_tokens_per_request: int = int(os.environ.get("ALEXANDRIA_MAX_TOKENS_PER_REQUEST", "0"))
+
     # Search
     search_limit: int = 10
 
@@ -87,6 +92,36 @@ KNOWN_EMBED_DIMS: dict[str, int] = {
     "openai/text-embedding-3-large": 3072,
     "openai/text-embedding-ada-002": 1536,
 }
+
+# Reverse lookup: dimension -> (backend, model).  Used to auto-detect the
+# correct embedder from a collection's vector size when no explicit metadata
+# is stored.  Only includes the *primary* (most common) model per dimension.
+DIM_TO_DEFAULT_MODEL: dict[int, tuple[str, str]] = {
+    768: ("ollama", "nomic-embed-text"),
+    1536: ("openai", "text-embedding-3-small"),
+    3072: ("openai", "text-embedding-3-large"),
+    1024: ("openai", "cohere-embed-v4"),
+}
+
+
+@dataclass
+class CollectionEmbedInfo:
+    """Embedding model metadata stored on a Qdrant collection.
+
+    This is persisted in the collection's ``metadata`` dict so that
+    Alexandria can auto-select the correct embedder at query time —
+    even if the server's environment variables point at a different
+    backend than the one used to build the index.
+
+    Args:
+        embed_backend: ``"ollama"`` or ``"openai"``.
+        embed_model: Model name (e.g. ``"nomic-embed-text"``).
+        embed_dim: Dimensionality of the stored vectors.
+    """
+
+    embed_backend: str
+    embed_model: str
+    embed_dim: int
 
 
 def load_project_config(repo_root: Path, config: Config) -> Config:

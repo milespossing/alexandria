@@ -18,6 +18,15 @@
           alexandriaEnv = {
             QDRANT_URL = "http://localhost:${toString cfg.qdrant.port}";
             OLLAMA_HOST = "http://localhost:11434";
+            ALEXANDRIA_EMBED_BACKEND = cfg.embed.backend;
+            ALEXANDRIA_EMBED_MODEL = cfg.embed.model;
+            ALEXANDRIA_EMBED_API_URL = cfg.embed.apiUrl;
+            ALEXANDRIA_EMBED_DIM = toString cfg.embed.dim;
+          };
+
+          # Shared serviceConfig attrs for EnvironmentFile (sops secret injection)
+          envFileAttrs = lib.optionalAttrs (cfg.environmentFile != null) {
+            EnvironmentFile = cfg.environmentFile;
           };
 
           # Generate a concrete indexer service for each entry in cfg.indexes
@@ -30,7 +39,7 @@
               serviceConfig = {
                 Type = "oneshot";
                 ExecStart = "${alexPkg}/bin/alex index --context ${name} ${toString indexCfg.path}";
-              };
+              } // envFileAttrs;
             }
           ) cfg.indexes;
 
@@ -65,11 +74,58 @@
               };
             };
 
-            ollama = {
+            environmentFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.path;
+              default = null;
+              description = ''
+                Path to a systemd EnvironmentFile containing secrets.
+                Use this with sops-nix to inject API keys without putting
+                them in the Nix store:
+
+                    sops.secrets."alexandria-env" = { };
+                    services.alexandria.environmentFile =
+                      config.sops.secrets."alexandria-env".path;
+
+                The file should contain lines like:
+                    ALEXANDRIA_EMBED_API_KEY=ghp_xxxxx
+                or:
+                    GITHUB_TOKEN=ghp_xxxxx
+              '';
+            };
+
+            embed = {
+              backend = lib.mkOption {
+                type = lib.types.enum [ "ollama" "openai" ];
+                default = "ollama";
+                description = ''
+                  Embedding backend. "ollama" uses a local Ollama instance;
+                  "openai" uses any OpenAI-compatible API (e.g. GitHub Models).
+                '';
+              };
+
               model = lib.mkOption {
                 type = lib.types.str;
                 default = "nomic-embed-text";
-                description = "Ollama embedding model to pull and use.";
+                description = "Embedding model name.";
+              };
+
+              apiUrl = lib.mkOption {
+                type = lib.types.str;
+                default = "https://models.github.ai/inference";
+                description = ''
+                  OpenAI-compatible embedding API URL.
+                  Only used when embed.backend is "openai".
+                '';
+              };
+
+              dim = lib.mkOption {
+                type = lib.types.int;
+                default = 0;
+                description = ''
+                  Embedding dimensions. Set to 0 to auto-detect from
+                  the model name (e.g. 768 for nomic-embed-text, 1536
+                  for text-embedding-3-small).
+                '';
               };
             };
 
@@ -113,24 +169,26 @@
               };
             };
 
-            # Ollama (upstream NixOS module)
-            services.ollama.enable = true;
+            # Ollama — only needed for the ollama embedding backend
+            services.ollama.enable = lib.mkDefault (cfg.embed.backend == "ollama");
 
-            # Oneshot: wait for Qdrant + Ollama, then pull the embedding model
-            # Uses `alex setup` which verifies both services and pulls the model
+            # Oneshot: verify Qdrant (and Ollama when applicable), pull model
+            # Uses `alex setup` which handles both backends automatically
             # Plus concrete indexer services (one per configured index)
             systemd.services = {
               alexandria-setup = {
-                description = "Alexandria setup — pull Ollama embedding model and verify Qdrant";
-                after = [ "ollama.service" "qdrant.service" ];
-                requires = [ "ollama.service" "qdrant.service" ];
+                description = "Alexandria setup — verify services and configure embedding model";
+                after = [ "qdrant.service" ]
+                  ++ lib.optionals (cfg.embed.backend == "ollama") [ "ollama.service" ];
+                requires = [ "qdrant.service" ]
+                  ++ lib.optionals (cfg.embed.backend == "ollama") [ "ollama.service" ];
                 wantedBy = [ "multi-user.target" ];
                 environment = alexandriaEnv;
                 serviceConfig = {
                   Type = "oneshot";
                   RemainAfterExit = true;
                   ExecStart = "${alexPkg}/bin/alex setup";
-                };
+                } // envFileAttrs;
               };
             } // indexerServices;
 

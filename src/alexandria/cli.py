@@ -233,6 +233,71 @@ def drop(context: str) -> None:
         console.print(f"[yellow]Context '{context}' not found.[/yellow]")
 
 
+@main.command(name="set-model")
+@click.option("--context", "-c", required=True, help="Context to update.")
+@click.option(
+    "--backend",
+    "-b",
+    required=True,
+    type=click.Choice(["ollama", "openai"]),
+    help="Embedding backend that was used to index this context.",
+)
+@click.option(
+    "--model",
+    "-m",
+    required=True,
+    help="Embedding model name (e.g. 'nomic-embed-text', 'text-embedding-3-small').",
+)
+@click.option(
+    "--dim",
+    "-d",
+    type=int,
+    default=None,
+    help="Override embedding dimension. If omitted, read from the collection.",
+)
+def set_model(context: str, backend: str, model: str, dim: int | None) -> None:
+    """Tag an existing context with its embedding model metadata.
+
+    This is needed when a context was indexed before Alexandria stored
+    model metadata, or when you need to manually correct it.  The MCP
+    server reads this metadata to auto-select the correct embedder at
+    query time — without it, you may get vector-dimension-mismatch errors.
+
+    Examples:
+
+        alex set-model -c MyProject --backend openai --model text-embedding-3-small
+
+        alex set-model -c Legacy -b ollama -m nomic-embed-text
+    """
+    from alexandria.store import Store
+
+    config = Config()
+    store = Store(config)
+
+    if not store.is_available():
+        console.print("[red]Error:[/red] Cannot connect to Qdrant.")
+        sys.exit(1)
+
+    # Verify the context exists.
+    existing = store.get_collection_embed_info(context)
+    if existing is None:
+        console.print(f"[red]Error:[/red] Context '{context}' not found.")
+        console.print("Run [bold]alex list[/bold] to see available contexts.")
+        sys.exit(1)
+
+    result = store.set_collection_metadata(
+        context,
+        embed_backend=backend,
+        embed_model=model,
+        embed_dim=dim,
+    )
+
+    console.print(f"[green]Updated[/green] context [cyan]{context}[/cyan] metadata:")
+    console.print(f"  Backend:   [bold]{result.embed_backend}[/bold]")
+    console.print(f"  Model:     [bold]{result.embed_model}[/bold]")
+    console.print(f"  Dimension: [bold]{result.embed_dim}[/bold]")
+
+
 @main.command(name="list")
 def list_contexts() -> None:
     """Show all indexed contexts and their stats."""
@@ -256,10 +321,20 @@ def list_contexts() -> None:
     table.add_column("Context", style="cyan")
     table.add_column("Chunks", justify="right")
     table.add_column("Status")
+    table.add_column("Backend", style="dim")
+    table.add_column("Model", style="dim")
+    table.add_column("Dim", justify="right", style="dim")
 
     for ctx in sorted(contexts):
         stats = store.get_context_stats(ctx)
-        table.add_row(ctx, str(stats["points"]), str(stats["status"]))
+        table.add_row(
+            ctx,
+            str(stats["points"]),
+            str(stats["status"]),
+            str(stats.get("embed_backend", "—")),
+            str(stats.get("embed_model", "—")),
+            str(stats.get("embed_dim", "—")),
+        )
 
     console.print(table)
 
